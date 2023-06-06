@@ -34,7 +34,7 @@ function executeCommands() {
         zabbix_sender -z ZABBIX_SERVER_IP -s "Webhook Listener" -k webhook.alert -o "$alert_message"
         log "Alert sent to Zabbix: $alert_message"
         unlock
-    }
+    fi
 }
 
 function startListener() {
