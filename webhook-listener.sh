@@ -1,4 +1,5 @@
 #!/bin/bash
+# Idea taken from orginal Author: Jaroslav Stepanek
 
 TCPPORT="12345"
 PIDFILE="/var/tmp/webhook-listener.pid"
