@@ -1,146 +1,118 @@
-#!/bin/bash
-# Idea taken from orginal Author: Jaroslav Stepanek
+#!/usr/bin/env bash
+set -euo pipefail
 
-TCPPORT="12345"
-PIDFILE="/var/tmp/webhook-listener.pid"
-LOCKFILE="/var/tmp/webhook-listener.lock"
-LOGFILE="/var/tmp/webhook-listener.log"
+ZBX_SERVER="zabbix.domain.com.br"
+ZBX_HOST="hostname.domain"
+ZBX_KEY="webhook.alert"
+LOGFILE="/var/log/webhook/webhook-listener.log"
 
-LISTENER_COMMAND="nc -l ${TCPPORT}"
-LISTENER_REGEX='^POST'
+log(){ echo "$(date) $*" >> "$LOGFILE"; }
 
-function log() {
-    echo "$(date) $*" >> "${LOGFILE}"
+# ---- read request line and headers (CRLF), detect Content-Length ----
+clen=0
+declare -A H
+
+IFS= read -r request_line || true
+
+while IFS= read -r line; do
+  line="${line%$'\r'}"
+  [ -z "$line" ] && break
+  if [[ "$line" =~ ^([A-Za-z0-9-]+):[[:space:]]*(.*)$ ]]; then
+     key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+     H["$key"]="$val"
+  fi
+done
+clen="${H[content-length]:-0}"
+
+# ---- read body exactly N bytes (if present) ----
+if [[ "$clen" =~ ^[0-9]+$ ]] && [ "$clen" -gt 0 ]; then
+  body="$(dd bs=1 count="$clen" 2>/dev/null || true)"
+else
+  body="$(cat || true)"   # fallback for when Content-Length is missing
+fi
+
+# ---- sanitize function: normalize whitespace and remove CR/LF ----
+sanitize(){
+  local s="${1//$'\r'/}"
+  s="${s//$'\n'/ }"
+  echo "$s" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
 
-function lock() {
-    if [ "${LOCKFILE}" ]; then
-        touch "${LOCKFILE}"
-    fi
+# ---- slugify: generate a safe identifier (for dim=) ----
+slugify(){
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  s="${s// /_}"
+  s=$(echo -n "$s" | sed 's/[^a-z0-9._-]/_/g; s/__*/_/g; s/^_//; s/_$//')
+  echo -n "$s" | cut -c1-128
 }
 
-function unlock() {
-    if [ "${LOCKFILE}" ]; then
-        rm -f "${LOCKFILE}"
-    fi
-}
+severity=""; policy=""; documentation=""; subject=""; state_raw=""; cond_name=""; dim=""
 
-function executeCommands() {
-    if [ "${LOCKFILE}" ] && [ -f "${LOCKFILE}" ]; then
-        log "Locked, no execution allowed"
-    else
-        lock
-        local line="$1"
-        local alert_message="Webhook alert: $line"
-        zabbix_sender -z ZABBIX_SERVER_IP -s "Webhook Listener" -k webhook.alert -o "$alert_message"
-        log "Alert sent to Zabbix: $alert_message"
-        unlock
-    fi
-}
+# ---- parse JSON with jq when available ----
+if command -v jq >/dev/null 2>&1; then
+  severity=$(printf '%s' "$body" | jq -r '.incident.severity // .severity // empty')
+  policy=$(printf '%s' "$body" | jq -r '.incident.policy_name // .policy_name // empty')
+  cond_name=$(printf '%s' "$body" | jq -r '.incident.condition_name // .incident.condition.displayName // empty')
+  documentation=$(printf '%s' "$body" | jq -r '
+    if (.incident.documentation | type=="object") then
+      .incident.documentation.content // .incident.documentation.subject
+    elif (.incident.documentation | type=="string") then
+      .incident.documentation
+    elif (.documentation | type=="object") then
+      .documentation.content // .documentation.subject
+    elif (.documentation | type=="string") then
+      .documentation
+    else empty end
+  ')
+  subject=$(printf '%s' "$body" | jq -r '.incident.documentation.subject // .documentation.subject // empty')
+  state_raw=$(printf '%s' "$body" | jq -r '.incident.state // .state // empty' | tr '[:upper:]' '[:lower:]')
+fi
 
-function startListener() {
-    trap onExit SIGHUP SIGINT SIGTERM
+# ---- fallback: extract severity from subject if not found ----
+if [ -z "$severity" ] && [ -n "$subject" ]; then
+  severity=$(printf '%s\n' "$subject" | sed -n 's/.*\[ALERT - \([^]]*\)\].*/\1/p')
+fi
+# ---- fallback: derive severity from state ----
+if [ -z "$severity" ]; then
+  case "$state_raw" in
+    open)   severity="Open" ;;
+    closed) severity="Resolved" ;;
+  esac
+fi
 
-    eval "${LISTENER_COMMAND}" | while read -r line; do
-        if [[ "$line" =~ ${LISTENER_REGEX} ]]; then
-            executeCommands "$line"
-        fi
-    done
-}
+# ---- cleanup values and apply limits ----
+severity=$(sanitize "${severity:-<no_severity>}")
+policy=$(sanitize "${policy:-<no_policy>}")
+documentation=$(sanitize "${documentation:-<no_documentation>}")
+documentation=$(echo -n "$documentation" | cut -c1-512)
 
-function listen() {
-    local mPid=0
+# ---- define "dim" (fingerprint): prefer condition_name, fallback to policy ----
+if [ -n "$cond_name" ]; then
+  dim="$cond_name"
+else
+  dim="$policy"
+fi
+[ -z "$dim" ] && dim="unknown"
+dim_slug=$(slugify "$dim")
 
-    trap onExit SIGHUP SIGINT SIGTERM
+# ---- normalize state ----
+state="unknown"
+case "$state_raw" in
+  open)   state="open" ;;
+  closed) state="closed" ;;
+esac
 
-    while true; do
-        startListener >/dev/null &
-        mPid=$!
-        wait "${mPid}"
-        sleep 1
-    done
-}
+# ---- final message (single item string) ----
+msg="${severity} | ${policy} | ${documentation} | dim=${dim_slug} | state=${state}"
 
-function onExit() {
-    local ncPid=$(pgrep -f "${LISTENER_COMMAND}")
-    kill "${ncPid}" &>/dev/null
-    exit 0
-}
+# ---- send to Zabbix via zabbix_sender ----
+zabbix_sender -z "$ZBX_SERVER" -s "$ZBX_HOST" -k "$ZBX_KEY" -o "$msg" >/dev/null 2>&1 || true
 
-function start() {
-    local mPid=0
+# ---- log debug info ----
+log "request_line: $request_line"
+log "dim: $dim -> $dim_slug | state: $state"
+log "Sent: ${ZBX_KEY} = $msg"
 
-    status &>/dev/null
-    if [ $? -gt 1 ]; then
-        echo "Process already running"
-        exit 0
-    fi
-
-    unlock
-
-    listen &>/dev/null &
-    mPid=$!
-    disown "${mPid}"
-    echo "${mPid}" > "${PIDFILE}"
-}
-
-function stop() {
-    local mPid=$(cat "${PIDFILE}")
-
-    if [ "${mPid}" ]; then
-        kill "${mPid}" && rm -f "${PIDFILE}"
-    fi
-
-    unlock
-}
-
-function status() {
-    local mPid=$(cat "${PIDFILE}" 2>/dev/null)
-
-    if [ "${mPid}" ]; then
-        ps -p "${mPid}" &>/dev/null
-
-        if [ $? -eq 0 ]; then
-            echo "Process is running with PID ${mPid}"
-            return 1
-        else
-            echo "Process is not running but the PID file still exists!"
-            return 0
-        fi
-    else
-        echo "Process is stopped"
-        return 0
-    fi
-}
-
-function main() {
-    local arg="${1}"
-    
-    case "${arg}" in
-        start)
-            start
-            exit 0
-            ;;
-        stop)
-            stop
-            exit 0
-            ;;
-        status)
-            status
-            exit 0
-            ;;
-        restart)
-            stop
-            sleep 1
-            start
-            exit 0
-            ;;
-        *)
-            echo "Usage: $0 {start|stop|status|restart}"
-            exit 0
-            ;;
-    esac
-}
-
-main "$@"
-exit 0
+# ---- reply HTTP 200 (prevent GCP retries) ----
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
