@@ -123,7 +123,7 @@ tail -f /var/log/webhook/webhook-listener.log
 
 ### Triggers Examples
 
-**VPN Outgoing Packets Dropped**\
+**VPN Outgoing Packets Dropped**
 - Problem expression:
 ```{=html}
 find(/hostname.domain/webhook.alert,#1,"regexp","dim=outgoing_packets_dropped\s*\|\s*state=open")=1
@@ -135,7 +135,7 @@ find(/hostname.domain/webhook.alert,#1,"regexp","dim=outgoing_packets_dropped\s*
 find(/hostname.domain/webhook.alert,#1,"regexp","dim=outgoing_packets_dropped\s*\|\s*state=closed")=1
 ```
 
-**VPN Incoming Packets Dropped**\
+**VPN Incoming Packets Dropped**
 - Problem expression:
 ```{=html}
 find(/hostname.domain/webhook.alert,#1,"regexp","dim=vpn_incoming_packets_dropped\s*\|\s*state=open")=1
